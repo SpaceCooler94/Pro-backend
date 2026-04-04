@@ -19,21 +19,20 @@ function fetchTank01(endpoint, params) {
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try { resolve(JSON.parse(data)); }
-        catch(e) { reject(new Error('Failed to parse response')); }
+        catch(e) { reject(new Error('Tank01 parse error')); }
       });
     }).on('error', reject);
   });
 }
 
-function fetchOdds(market) {
+function fetchURL(url) {
   return new Promise((resolve, reject) => {
-    const url = `https://api.the-odds-api.com/v4/sports/basketball_nba/events?apiKey=${ODDS_API_KEY}&regions=us&markets=${market}&oddsFormat=american`;
     https.get(url, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try { resolve(JSON.parse(data)); }
-        catch(e) { reject(new Error('Failed to parse odds')); }
+        catch(e) { reject(new Error('URL parse error')); }
       });
     }).on('error', reject);
   });
@@ -62,25 +61,59 @@ function analyzePlayer(games, line, stat) {
   return { skip: false, avgMins, avgFGA, L5, L10, L20, line, stat, confirmed };
 }
 
+function findPlayerProps(events, playerName, market) {
+  const results = [];
+  for (const event of events) {
+    if (!event.bookmakers) continue;
+    for (const book of event.bookmakers) {
+      if (!['fanduel', 'draftkings'].includes(book.key)) continue;
+      for (const mkt of book.markets) {
+        if (mkt.key !== market) continue;
+        for (const outcome of mkt.outcomes) {
+          if (outcome.description && outcome.description.toLowerCase().includes(playerName.toLowerCase())) {
+            results.push({
+              game: `${event.away_team} @ ${event.home_team}`,
+              book: book.key,
+              name: outcome.description,
+              type: outcome.name,
+              point: outcome.point,
+              price: outcome.price
+            });
+          }
+        }
+      }
+    }
+  }
+  return results;
+}
+
 const server = http.createServer(async (req, res) => {
   res.writeHead(200, {'Content-Type': 'application/json'});
   try {
-    const [playerData, oddsData] = await Promise.all([
-      fetchTank01('getNBAGamesForPlayer', {
-        playerID: '28268405032',
-        numberOfGames: '20',
-        season: '2024'
-      }),
-      fetchOdds('player_rebounds')
-    ]);
+    const playerName = 'Nikola Vucevic';
+    const market = 'player_rebounds';
+    const stat = 'reb';
+    const line = 9.5;
 
-    const analysis = analyzePlayer(playerData.body, 9.5, 'reb');
-    
-    res.end(JSON.stringify({
-      analysis,
-      oddsAvailable: Array.isArray(oddsData) ? oddsData.length : 0,
-      sample: Array.isArray(oddsData) ? oddsData[0] : oddsData
-    }));
+    const eventsUrl = `https://api.the-odds-api.com/v4/sports/basketball_nba/events?apiKey=${ODDS_API_KEY}`;
+    const events = await fetchURL(eventsUrl);
+
+    const propPromises = events.map(e =>
+      fetchURL(`https://api.the-odds-api.com/v4/sports/basketball_nba/events/${e.id}/odds?apiKey=${ODDS_API_KEY}&regions=us&markets=${market}&oddsFormat=american&bookmakers=fanduel,draftkings`)
+    );
+    const propResults = await Promise.all(propPromises);
+
+    const props = findPlayerProps(propResults, playerName, market);
+
+    const playerData = await fetchTank01('getNBAGamesForPlayer', {
+      playerID: '28268405032',
+      numberOfGames: '20',
+      season: '2024'
+    });
+
+    const analysis = analyzePlayer(playerData.body, line, stat);
+
+    res.end(JSON.stringify({ playerName, analysis, props }));
   } catch(e) {
     res.end(JSON.stringify({ status: 'error', message: e.message }));
   }
