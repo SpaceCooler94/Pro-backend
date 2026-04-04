@@ -62,6 +62,24 @@ function analyzePlayer(games, line, stat) {
   return { skip: false, avgMins, avgFGA, L5, L10, L20, line, stat, confirmed };
 }
 
+function getSharpPrice(bookmakers, playerName, marketKey) {
+  const sharpBooks = ['novig', 'pinnacle'];
+  for (const book of bookmakers) {
+    if (!sharpBooks.includes(book.key)) continue;
+    for (const market of book.markets) {
+      if (market.key !== marketKey) continue;
+      for (const outcome of market.outcomes) {
+        if (outcome.name === 'Over' &&
+            outcome.description &&
+            outcome.description.toLowerCase() === playerName.toLowerCase()) {
+          return { book: book.key, price: outcome.price, point: outcome.point };
+        }
+      }
+    }
+  }
+  return null;
+}
+
 const STAT_MAP = {
   player_rebounds: 'reb',
   player_points: 'pts',
@@ -106,13 +124,16 @@ const server = http.createServer(async (req, res) => {
     const seen = new Set();
 
     for (const event of events) {
+      // fetch soft books + sharp books in one call
       const eventProps = await fetchURL(
-        `https://api.the-odds-api.com/v4/sports/basketball_nba/events/${event.id}/odds?apiKey=${ODDS_API_KEY}&regions=us&markets=${MARKETS.join(',')}&oddsFormat=american&bookmakers=fanduel,draftkings`
+        `https://api.the-odds-api.com/v4/sports/basketball_nba/events/${event.id}/odds?apiKey=${ODDS_API_KEY}&regions=us,us_ex&markets=${MARKETS.join(',')}&oddsFormat=american&bookmakers=fanduel,draftkings,novig,pinnacle`
       );
 
       if (!eventProps.bookmakers) continue;
 
       for (const book of eventProps.bookmakers) {
+        if (!['fanduel', 'draftkings'].includes(book.key)) continue;
+
         for (const market of book.markets) {
           const stat = STAT_MAP[market.key];
           if (!stat) continue;
@@ -127,6 +148,11 @@ const server = http.createServer(async (req, res) => {
 
             if (seen.has(key)) continue;
             seen.add(key);
+
+            // check sharp book first before hitting Tank01
+            const sharpLine = getSharpPrice(eventProps.bookmakers, playerName, market.key);
+            if (!sharpLine) continue; // no sharp line found, skip
+            if (sharpLine.price > -150) continue; // not sharp enough
 
             const playerID = findPlayerID(playerName);
             if (!playerID) continue;
@@ -148,7 +174,9 @@ const server = http.createServer(async (req, res) => {
               book: book.key,
               market: market.key,
               line,
-              price,
+              retailPrice: price,
+              sharpBook: sharpLine.book,
+              sharpPrice: sharpLine.price,
               avgMins: analysis.avgMins,
               avgFGA: analysis.avgFGA,
               L5: analysis.L5,
