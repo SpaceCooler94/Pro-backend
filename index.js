@@ -2,6 +2,7 @@ const http = require('http');
 const https = require('https');
 
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
+console.log('API KEY:', RAPIDAPI_KEY ? 'loaded' : 'undefined');
 
 function fetchTank01(endpoint, params) {
   return new Promise((resolve, reject) => {
@@ -45,4 +46,4 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(process.env.PORT || 3000, () => {
   console.log('Server running');
-})
+});
