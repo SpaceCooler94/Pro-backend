@@ -1,35 +1,28 @@
 const http = require('http');
 const https = require('https');
 
+const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
 
-const cache = {};
-
-function fetchNBA(url) {
+function fetchTank01(endpoint, params) {
   return new Promise((resolve, reject) => {
+    const queryString = new URLSearchParams(params).toString();
+    const url = `https://tank01-fantasy-stats.p.rapidapi.com/${endpoint}${queryString ? '?' + queryString : ''}`;
     const options = {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://www.nba.com/',
-        'Origin': 'https://www.nba.com',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'x-nba-stats-origin': 'stats',
-        'x-nba-stats-token': 'true',
-        'Connection': 'keep-alive'
-      },
-      timeout: 15000
+        'x-rapidapi-host': 'tank01-fantasy-stats.p.rapidapi.com',
+        'x-rapidapi-key': RAPIDAPI_KEY,
+        'Content-Type': 'application/json'
+      }
     };
-    const req = https.get(url, options, (res) => {
+    https.get(url, options, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try { resolve(JSON.parse(data)); }
-        catch(e) { reject(new Error('NBA parse error')); }
+        catch(e) { reject(new Error('Tank01 parse error')); }
       });
-    });
-    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-    req.on('error', reject);
+    }).on('error', reject);
   });
 }
 
@@ -46,36 +39,6 @@ function fetchURL(url) {
   });
 }
 
-async function getPlayerGameLog(playerID) {
-  if (cache[playerID]) return cache[playerID];
-  const url = `https://stats.nba.com/stats/playergamelog?PlayerID=${playerID}&Season=2024-25&SeasonType=Regular+Season`;
-  const data = await fetchNBA(url);
-  const rows = data.resultSets[0].rowSet;
-  const headers = data.resultSets[0].headers;
-  const games = rows.map(row => {
-    const obj = {};
-    headers.forEach((h, i) => obj[h] = row[i]);
-    return obj;
-  });
-  cache[playerID] = games;
-  return games;
-}
-
-async function getNBAPlayerList() {
-  if (cache['playerList']) return cache['playerList'];
-  const url = 'https://stats.nba.com/stats/commonallplayers?LeagueID=00&Season=2024-25&IsOnlyCurrentSeason=1';
-  const data = await fetchNBA(url);
-  const rows = data.resultSets[0].rowSet;
-  const map = {};
-  rows.forEach(row => {
-    const name = row[2].toLowerCase().trim();
-    const id = row[0];
-    map[name] = id;
-  });
-  cache['playerList'] = map;
-  return map;
-}
-
 function calcAvg(games, stat, count) {
   const recent = games.slice(0, count);
   if (recent.length === 0) return null;
@@ -84,33 +47,56 @@ function calcAvg(games, stat, count) {
 }
 
 function analyzePlayer(games, line, stat) {
-  const avgMins = calcAvg(games, 'MIN', 10);
-  const avgFGA = calcAvg(games, 'FGA', 10);
+  const gameList = Object.values(games);
+  const avgMins = calcAvg(gameList, 'mins', 10);
+  const avgFGA = calcAvg(gameList, 'fga', 10);
 
-  if (!avgMins || avgMins < 25) return { skip: true, reason: 'insufficient minutes' };
-  if (!avgFGA || avgFGA < 10) return { skip: true, reason: 'insufficient usage' };
+  if (avgMins < 25) return { skip: true, reason: 'insufficient minutes' };
+  if (avgFGA < 10) return { skip: true, reason: 'insufficient usage' };
 
-  const L5 = calcAvg(games, stat, 5);
-  const L10 = calcAvg(games, stat, 10);
-  const L20 = calcAvg(games, stat, 20);
+  const L5 = calcAvg(gameList, stat, 5);
+  const L10 = calcAvg(gameList, stat, 10);
+  const L20 = calcAvg(gameList, stat, 20);
   const confirmed = L5 > line && L10 > line;
 
   return { skip: false, avgMins, avgFGA, L5, L10, L20, line, stat, confirmed };
 }
 
 const STAT_MAP = {
-  player_rebounds: 'REB',
-  player_points: 'PTS',
-  player_assists: 'AST',
-  player_threes: 'FG3M'
+  player_rebounds: 'reb',
+  player_points: 'pts',
+  player_assists: 'ast',
+  player_threes: 'tptfgm'
 };
 
 const MARKETS = Object.keys(STAT_MAP);
 
+let playerMap = {};
+
+async function loadPlayerMap() {
+  try {
+    const data = await fetchTank01('getNBAPlayerList', {});
+    if (data.body && Array.isArray(data.body)) {
+      for (const player of data.body) {
+        playerMap[player.longName.toLowerCase().trim()] = player.playerID;
+      }
+      console.log(`Loaded ${Object.keys(playerMap).length} players`);
+    }
+  } catch(e) {
+    console.log('Failed to load player map:', e.message);
+  }
+}
+
+function findPlayerID(playerName) {
+  return playerMap[playerName.toLowerCase().trim()] || null;
+}
+
 const server = http.createServer(async (req, res) => {
   res.writeHead(200, {'Content-Type': 'application/json'});
   try {
-    const playerMap = await getNBAPlayerList();
+    if (Object.keys(playerMap).length === 0) {
+      await loadPlayerMap();
+    }
 
     const events = await fetchURL(
       `https://api.the-odds-api.com/v4/sports/basketball_nba/events?apiKey=${ODDS_API_KEY}`
@@ -142,19 +128,18 @@ const server = http.createServer(async (req, res) => {
             if (seen.has(key)) continue;
             seen.add(key);
 
-            const playerID = playerMap[playerName.toLowerCase().trim()];
+            const playerID = findPlayerID(playerName);
             if (!playerID) continue;
 
-            let games;
-            try {
-              games = await getPlayerGameLog(playerID);
-            } catch(e) {
-              continue;
-            }
+            const playerData = await fetchTank01('getNBAGamesForPlayer', {
+              playerID,
+              numberOfGames: '20',
+              season: '2025'
+            });
 
-            if (!games || games.length === 0) continue;
+            if (!playerData.body) continue;
 
-            const analysis = analyzePlayer(games, line, stat);
+            const analysis = analyzePlayer(playerData.body, line, stat);
             if (analysis.skip || !analysis.confirmed) continue;
 
             confirmedPlays.push({
@@ -183,4 +168,5 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(process.env.PORT || 3000, () => {
   console.log('Server running');
+  loadPlayerMap();
 });
