@@ -38,14 +38,27 @@ function calcAvg(games, stat, count) {
 
 function analyzePlayer(games, line, stat) {
   const gameList = Object.values(games);
+  
+  const avgMins = calcAvg(gameList, 'mins', 10);
+  if (avgMins < 25) {
+    return { skip: true, reason: 'insufficient minutes', avgMins };
+  }
+
+  const L5 = calcAvg(gameList, stat, 5);
+  const L10 = calcAvg(gameList, stat, 10);
+  const L20 = calcAvg(gameList, stat, 20);
+
   return {
-    L5: calcAvg(gameList, stat, 5),
-    L10: calcAvg(gameList, stat, 10),
-    L20: calcAvg(gameList, stat, 20),
-    line: line,
-    stat: stat,
-    L5_over_line: calcAvg(gameList, stat, 5) > line,
-    L10_over_line: calcAvg(gameList, stat, 10) > line
+    skip: false,
+    avgMins,
+    L5,
+    L10,
+    L20,
+    line,
+    stat,
+    L5_over_line: L5 > line,
+    L10_over_line: L10 > line,
+    confirmed: L5 > line && L10 > line
   };
 }
 
