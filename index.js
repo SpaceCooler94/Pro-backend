@@ -116,15 +116,20 @@ const server = http.createServer(async (req, res) => {
       await loadPlayerMap();
     }
 
+    const today = new Date();
+    const todayStr = today.toISOString().split('T')[0];
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const tomorrowStr = tomorrow.toISOString().split('T')[0];
+
     const events = await fetchURL(
-      `https://api.the-odds-api.com/v4/sports/basketball_nba/events?apiKey=${ODDS_API_KEY}`
+      `https://api.the-odds-api.com/v4/sports/basketball_nba/events?apiKey=${ODDS_API_KEY}&commenceTimeFrom=${todayStr}T00:00:00Z&commenceTimeTo=${tomorrowStr}T00:00:00Z`
     );
 
     const confirmedPlays = [];
     const seen = new Set();
 
     for (const event of events) {
-      // fetch soft books + sharp books in one call
       const eventProps = await fetchURL(
         `https://api.the-odds-api.com/v4/sports/basketball_nba/events/${event.id}/odds?apiKey=${ODDS_API_KEY}&regions=us,us_ex&markets=${MARKETS.join(',')}&oddsFormat=american&bookmakers=fanduel,draftkings,novig,pinnacle`
       );
@@ -149,10 +154,9 @@ const server = http.createServer(async (req, res) => {
             if (seen.has(key)) continue;
             seen.add(key);
 
-            // check sharp book first before hitting Tank01
             const sharpLine = getSharpPrice(eventProps.bookmakers, playerName, market.key);
-            if (!sharpLine) continue; // no sharp line found, skip
-            if (sharpLine.price > -150) continue; // not sharp enough
+            if (!sharpLine) continue;
+            if (sharpLine.price > -150) continue;
 
             const playerID = findPlayerID(playerName);
             if (!playerID) continue;
