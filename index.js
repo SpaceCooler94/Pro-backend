@@ -124,8 +124,7 @@ const server = http.createServer(async (req, res) => {
 
             const playerData = await fetchTank01('getNBAGamesForPlayer', {
               playerID,
-              numberOfGames: '20',
-              season: '2026'
+              numberOfGames: '20'
             });
 
             if (!playerData.body) continue;
