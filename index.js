@@ -38,19 +38,28 @@ function calcAvg(games, stat, count) {
 
 function analyzePlayer(games, line, stat) {
   const gameList = Object.values(games);
-  
+
   const avgMins = calcAvg(gameList, 'mins', 10);
+  const avgFGA = calcAvg(gameList, 'fga', 10);
+
   if (avgMins < 25) {
     return { skip: true, reason: 'insufficient minutes', avgMins };
+  }
+
+  if (avgFGA < 10) {
+    return { skip: true, reason: 'insufficient usage', avgFGA };
   }
 
   const L5 = calcAvg(gameList, stat, 5);
   const L10 = calcAvg(gameList, stat, 10);
   const L20 = calcAvg(gameList, stat, 20);
 
+  const confirmed = L5 > line && L10 > line;
+
   return {
     skip: false,
     avgMins,
+    avgFGA,
     L5,
     L10,
     L20,
@@ -58,7 +67,7 @@ function analyzePlayer(games, line, stat) {
     stat,
     L5_over_line: L5 > line,
     L10_over_line: L10 > line,
-    confirmed: L5 > line && L10 > line
+    confirmed
   };
 }
 
