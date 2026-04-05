@@ -39,22 +39,6 @@ function fetchURL(url) {
   });
 }
 
-function fetchHTML(url) {
-  return new Promise((resolve, reject) => {
-    const options = {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'text/html,application/xhtml+xml',
-      }
-    };
-    https.get(url, options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => resolve(data));
-    }).on('error', reject);
-  });
-}
-
 // ── VARIANCE FILTER ───────────────────────────────────────────────────────────
 function calcStdDev(games, stat, count) {
   const recent = games.slice(0, count);
@@ -101,54 +85,54 @@ function isInjured(playerName) {
   return ['OUT', 'DOUBTFUL'].includes(status);
 }
 
-// ── DVP FROM HASHTAG BASKETBALL ───────────────────────────────────────────────
+// ── DVP FROM NBA STATS API ────────────────────────────────────────────────────
 let dvpMap = {};
 let dvpLastFetched = 0;
 
-const DVP_STAT_MAP = {
+const DVP_STAT_COLS = {
   player_points: 'PTS',
   player_rebounds: 'REB',
   player_assists: 'AST',
-  player_threes: '3PM'
+  player_threes: 'FG3M'
 };
 
 async function loadDVP() {
   if (Date.now() - dvpLastFetched < 60 * 60 * 1000) return;
   try {
-    const html = await fetchHTML('https://hashtagbasketball.com/nba-defense-vs-position');
+    const url = 'https://stats.nba.com/stats/leaguedashteamstats?Season=2024-25&SeasonType=Regular+Season&PerMode=PerGame&MeasureType=Opponent&LastNGames=0&PaceAdjust=N&PlusMinus=N&Rank=Y';
+    const options = {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        'Referer': 'https://www.nba.com/',
+        'x-nba-stats-origin': 'stats',
+        'x-nba-stats-token': 'true',
+        'Accept': 'application/json'
+      },
+      timeout: 15000
+    };
+
+    const data = await new Promise((resolve, reject) => {
+      const req = https.get(url, options, (res) => {
+        let d = '';
+        res.on('data', chunk => d += chunk);
+        res.on('end', () => {
+          try { resolve(JSON.parse(d)); }
+          catch(e) { reject(new Error('DVP parse error')); }
+        });
+      });
+      req.on('timeout', () => { req.destroy(); reject(new Error('DVP timeout')); });
+      req.on('error', reject);
+    });
+
+    const rs = data.resultSets[0];
+    const hdrs = rs.headers;
     dvpMap = {};
 
-    // parse table rows for team defensive rankings
-    const rowRegex = /<tr[^>]*>[\s\S]*?<\/tr>/gi;
-    const cellRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
-    const rows = html.match(rowRegex) || [];
-
-    let headers = [];
-    let headerFound = false;
-
-    for (const row of rows) {
-      const cells = [];
-      let m;
-      while ((m = cellRegex.exec(row)) !== null) {
-        cells.push(m[1].replace(/<[^>]+>/g, '').trim());
-      }
-      cellRegex.lastIndex = 0;
-
-      if (!headerFound && cells.some(c => c === 'TEAM')) {
-        headers = cells;
-        headerFound = true;
-        continue;
-      }
-
-      if (headerFound && cells.length > 2) {
-        const team = cells[0];
-        if (!team || team.length < 2) continue;
-        dvpMap[team] = {};
-        headers.forEach((h, i) => {
-          if (cells[i]) dvpMap[team][h] = cells[i];
-        });
-      }
-    }
+    rs.rowSet.forEach(row => {
+      const obj = {};
+      hdrs.forEach((h, i) => obj[h] = row[i]);
+      dvpMap[obj.TEAM_NAME] = obj;
+    });
 
     dvpLastFetched = Date.now();
     console.log(`Loaded DVP for ${Object.keys(dvpMap).length} teams`);
@@ -158,12 +142,11 @@ async function loadDVP() {
 }
 
 function getDVPRank(teamName, marketKey) {
-  const statKey = DVP_STAT_MAP[marketKey];
-  if (!statKey || !dvpMap) return null;
+  const statCol = DVP_STAT_COLS[marketKey];
+  if (!statCol || !Object.keys(dvpMap).length) return null;
 
-  // try to match team name
   const teamKey = Object.keys(dvpMap).find(k =>
-    teamName.toLowerCase().includes(k.toLowerCase()) ||
+    teamName.toLowerCase().includes(k.toLowerCase().split(' ').pop()) ||
     k.toLowerCase().includes(teamName.toLowerCase().split(' ').pop())
   );
 
@@ -171,11 +154,8 @@ function getDVPRank(teamName, marketKey) {
   const row = dvpMap[teamKey];
   if (!row) return null;
 
-  // look for rank column like PTS_RANK or #PTS
-  const rankKey = Object.keys(row).find(k => k.includes(statKey) && k.includes('RANK'));
-  if (rankKey) return parseInt(row[rankKey]);
-
-  return null;
+  const rankKey = `OPP_${statCol}_RANK`;
+  return row[rankKey] ? parseInt(row[rankKey]) : null;
 }
 
 // ── PLAYER ANALYSIS ───────────────────────────────────────────────────────────
@@ -191,7 +171,6 @@ function analyzePlayer(games, line, stat) {
   const L10 = calcAvg(gameList, stat, 10);
   const L20 = calcAvg(gameList, stat, 20);
 
-  // variance filter — skip if std dev over L10 is more than 2x the line
   const stdDev = calcStdDev(gameList, stat, 10);
   if (stdDev !== null && stdDev > line * 0.8) {
     return { skip: true, reason: 'high variance' };
@@ -300,7 +279,6 @@ const server = http.createServer(async (req, res) => {
             if (seen.has(key)) continue;
             seen.add(key);
 
-            // injury filter
             if (isInjured(playerName)) continue;
 
             const sharpLine = getSharpPrice(eventProps.bookmakers, playerName, market.key);
@@ -321,7 +299,8 @@ const server = http.createServer(async (req, res) => {
             const analysis = analyzePlayer(playerData.body, line, stat);
             if (analysis.skip || !analysis.confirmed) continue;
 
-            // DVP check — skip if opponent defense is top 8 against this stat
+            // get DVP rank for the defending team
+            // player's team is either home or away — opponent is the other
             const dvpRank = getDVPRank(homeTeam, market.key) || getDVPRank(awayTeam, market.key);
 
             confirmedPlays.push({
@@ -346,7 +325,6 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // sort by sharpest price first
     confirmedPlays.sort((a, b) => a.sharpPrice - b.sharpPrice);
 
     res.end(JSON.stringify({ confirmedPlays, total: confirmedPlays.length }));
