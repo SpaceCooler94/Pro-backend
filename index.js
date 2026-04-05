@@ -4,6 +4,11 @@ const https = require('https');
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
 
+// ── CACHE ─────────────────────────────────────────────────────────────────────
+let cachedResult = null;
+let cacheTime = 0;
+const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+
 function fetchTank01(endpoint, params) {
   return new Promise((resolve, reject) => {
     const queryString = new URLSearchParams(params).toString();
@@ -127,94 +132,107 @@ function findPlayerID(playerName) {
   return playerMap[playerName.toLowerCase().trim()] || null;
 }
 
-const server = http.createServer(async (req, res) => {
-  res.writeHead(200, {'Content-Type': 'application/json'});
-  try {
-    if (Object.keys(playerMap).length === 0) await loadPlayerMap();
+async function runAnalysis() {
+  if (Object.keys(playerMap).length === 0) await loadPlayerMap();
 
-    const today = new Date();
-    const todayStr = today.toISOString().split('T')[0];
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    const tomorrowStr = tomorrow.toISOString().split('T')[0];
+  const today = new Date();
+  const todayStr = today.toISOString().split('T')[0];
+  const tomorrow = new Date(today);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const tomorrowStr = tomorrow.toISOString().split('T')[0];
 
-    const events = await fetchURL(
-      `https://api.the-odds-api.com/v4/sports/basketball_nba/events?apiKey=${ODDS_API_KEY}&commenceTimeFrom=${todayStr}T00:00:00Z&commenceTimeTo=${tomorrowStr}T00:00:00Z`
+  const events = await fetchURL(
+    `https://api.the-odds-api.com/v4/sports/basketball_nba/events?apiKey=${ODDS_API_KEY}&commenceTimeFrom=${todayStr}T00:00:00Z&commenceTimeTo=${tomorrowStr}T00:00:00Z`
+  );
+
+  const confirmedPlays = [];
+  const seen = new Set();
+
+  for (const event of events) {
+    const homeTeam = event.home_team;
+    const awayTeam = event.away_team;
+
+    const eventProps = await fetchURL(
+      `https://api.the-odds-api.com/v4/sports/basketball_nba/events/${event.id}/odds?apiKey=${ODDS_API_KEY}&regions=us,us_ex&markets=${MARKETS.join(',')}&oddsFormat=american&bookmakers=fanduel,draftkings,novig,pinnacle`
     );
 
-    const confirmedPlays = [];
-    const seen = new Set();
+    if (!eventProps.bookmakers) continue;
 
-    for (const event of events) {
-      const homeTeam = event.home_team;
-      const awayTeam = event.away_team;
+    for (const book of eventProps.bookmakers) {
+      if (!['fanduel', 'draftkings'].includes(book.key)) continue;
 
-      const eventProps = await fetchURL(
-        `https://api.the-odds-api.com/v4/sports/basketball_nba/events/${event.id}/odds?apiKey=${ODDS_API_KEY}&regions=us,us_ex&markets=${MARKETS.join(',')}&oddsFormat=american&bookmakers=fanduel,draftkings,novig,pinnacle`
-      );
+      for (const market of book.markets) {
+        const stat = STAT_MAP[market.key];
+        if (!stat) continue;
 
-      if (!eventProps.bookmakers) continue;
+        for (const outcome of market.outcomes) {
+          if (outcome.name !== 'Over') continue;
 
-      for (const book of eventProps.bookmakers) {
-        if (!['fanduel', 'draftkings'].includes(book.key)) continue;
+          const playerName = outcome.description;
+          const line = outcome.point;
+          const price = outcome.price;
+          const key = `${playerName}|${market.key}|${line}|${book.key}`;
 
-        for (const market of book.markets) {
-          const stat = STAT_MAP[market.key];
-          if (!stat) continue;
+          if (seen.has(key)) continue;
+          seen.add(key);
 
-          for (const outcome of market.outcomes) {
-            if (outcome.name !== 'Over') continue;
+          const sharpLine = getSharpPrice(eventProps.bookmakers, playerName, market.key);
+          if (!sharpLine) continue;
+          if (sharpLine.price > -150) continue;
 
-            const playerName = outcome.description;
-            const line = outcome.point;
-            const price = outcome.price;
-            const key = `${playerName}|${market.key}|${line}|${book.key}`;
+          const playerID = findPlayerID(playerName);
+          if (!playerID) continue;
 
-            if (seen.has(key)) continue;
-            seen.add(key);
+          const playerData = await fetchTank01('getNBAGamesForPlayer', {
+            playerID,
+            numberOfGames: '20',
+            season: '2025'
+          });
 
-            const sharpLine = getSharpPrice(eventProps.bookmakers, playerName, market.key);
-            if (!sharpLine) continue;
-            if (sharpLine.price > -150) continue;
+          if (!playerData.body) continue;
 
-            const playerID = findPlayerID(playerName);
-            if (!playerID) continue;
+          const analysis = analyzePlayer(playerData.body, line, stat);
+          if (analysis.skip || !analysis.confirmed) continue;
 
-            const playerData = await fetchTank01('getNBAGamesForPlayer', {
-              playerID,
-              numberOfGames: '20',
-              season: '2025'
-            });
-
-            if (!playerData.body) continue;
-
-            const analysis = analyzePlayer(playerData.body, line, stat);
-            if (analysis.skip || !analysis.confirmed) continue;
-
-            confirmedPlays.push({
-              player: playerName,
-              game: `${awayTeam} @ ${homeTeam}`,
-              book: book.key,
-              market: market.key,
-              line,
-              retailPrice: price,
-              sharpBook: sharpLine.book,
-              sharpPrice: sharpLine.price,
-              avgMins: analysis.avgMins,
-              avgFGA: analysis.avgFGA,
-              L5: analysis.L5,
-              L10: analysis.L10,
-              L20: analysis.L20,
-              stdDev: analysis.stdDev
-            });
-          }
+          confirmedPlays.push({
+            player: playerName,
+            game: `${awayTeam} @ ${homeTeam}`,
+            book: book.key,
+            market: market.key,
+            line,
+            retailPrice: price,
+            sharpBook: sharpLine.book,
+            sharpPrice: sharpLine.price,
+            avgMins: analysis.avgMins,
+            avgFGA: analysis.avgFGA,
+            L5: analysis.L5,
+            L10: analysis.L10,
+            L20: analysis.L20,
+            stdDev: analysis.stdDev
+          });
         }
       }
     }
+  }
 
-    confirmedPlays.sort((a, b) => a.sharpPrice - b.sharpPrice);
+  confirmedPlays.sort((a, b) => a.sharpPrice - b.sharpPrice);
+  return { confirmedPlays, total: confirmedPlays.length, cachedAt: new Date().toISOString() };
+}
 
-    res.end(JSON.stringify({ confirmedPlays, total: confirmedPlays.length }));
+const server = http.createServer(async (req, res) => {
+  res.writeHead(200, {'Content-Type': 'application/json'});
+  try {
+    const now = Date.now();
+    if (cachedResult && (now - cacheTime) < CACHE_TTL) {
+      console.log('Serving from cache');
+      return res.end(JSON.stringify({ ...cachedResult, fromCache: true }));
+    }
+
+    console.log('Running fresh analysis');
+    const result = await runAnalysis();
+    cachedResult = result;
+    cacheTime = now;
+    res.end(JSON.stringify({ ...result, fromCache: false }));
   } catch(e) {
     res.end(JSON.stringify({ status: 'error', message: e.message }));
   }
