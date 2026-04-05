@@ -39,7 +39,6 @@ function fetchURL(url) {
   });
 }
 
-// ── VARIANCE FILTER ───────────────────────────────────────────────────────────
 function calcStdDev(games, stat, count) {
   const recent = games.slice(0, count);
   if (recent.length < 3) return null;
@@ -56,109 +55,6 @@ function calcAvg(games, stat, count) {
   return parseFloat((total / recent.length).toFixed(2));
 }
 
-// ── TANK01 INJURIES ───────────────────────────────────────────────────────────
-let injuryMap = {};
-let injuryLastFetched = 0;
-
-async function loadInjuries() {
-  if (Date.now() - injuryLastFetched < 30 * 60 * 1000) return;
-  try {
-    const data = await fetchTank01('getNBAInjuryList', {});
-    injuryMap = {};
-    if (data.body) {
-      for (const player of Object.values(data.body)) {
-        const name = (player.longName || '').toLowerCase().trim();
-        const status = (player.injuryStatus || '').toUpperCase();
-        if (name && status) injuryMap[name] = status;
-      }
-    }
-    injuryLastFetched = Date.now();
-    console.log(`Loaded ${Object.keys(injuryMap).length} injury records`);
-  } catch(e) {
-    console.log('Injury load failed:', e.message);
-  }
-}
-
-function isInjured(playerName) {
-  const status = injuryMap[playerName.toLowerCase().trim()];
-  if (!status) return false;
-  return ['OUT', 'DOUBTFUL'].includes(status);
-}
-
-// ── DVP FROM NBA STATS API ────────────────────────────────────────────────────
-let dvpMap = {};
-let dvpLastFetched = 0;
-
-const DVP_STAT_COLS = {
-  player_points: 'PTS',
-  player_rebounds: 'REB',
-  player_assists: 'AST',
-  player_threes: 'FG3M'
-};
-
-async function loadDVP() {
-  if (Date.now() - dvpLastFetched < 60 * 60 * 1000) return;
-  try {
-    const url = 'https://stats.nba.com/stats/leaguedashteamstats?Season=2024-25&SeasonType=Regular+Season&PerMode=PerGame&MeasureType=Opponent&LastNGames=0&PaceAdjust=N&PlusMinus=N&Rank=Y';
-    const options = {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-        'Referer': 'https://www.nba.com/',
-        'x-nba-stats-origin': 'stats',
-        'x-nba-stats-token': 'true',
-        'Accept': 'application/json'
-      },
-      timeout: 15000
-    };
-
-    const data = await new Promise((resolve, reject) => {
-      const req = https.get(url, options, (res) => {
-        let d = '';
-        res.on('data', chunk => d += chunk);
-        res.on('end', () => {
-          try { resolve(JSON.parse(d)); }
-          catch(e) { reject(new Error('DVP parse error')); }
-        });
-      });
-      req.on('timeout', () => { req.destroy(); reject(new Error('DVP timeout')); });
-      req.on('error', reject);
-    });
-
-    const rs = data.resultSets[0];
-    const hdrs = rs.headers;
-    dvpMap = {};
-
-    rs.rowSet.forEach(row => {
-      const obj = {};
-      hdrs.forEach((h, i) => obj[h] = row[i]);
-      dvpMap[obj.TEAM_NAME] = obj;
-    });
-
-    dvpLastFetched = Date.now();
-    console.log(`Loaded DVP for ${Object.keys(dvpMap).length} teams`);
-  } catch(e) {
-    console.log('DVP load failed:', e.message);
-  }
-}
-
-function getDVPRank(teamName, marketKey) {
-  const statCol = DVP_STAT_COLS[marketKey];
-  if (!statCol || !Object.keys(dvpMap).length) return null;
-
-  const teamKey = Object.keys(dvpMap).find(k =>
-    teamName.toLowerCase().includes(k.toLowerCase().split(' ').pop()) ||
-    k.toLowerCase().includes(teamName.toLowerCase().split(' ').pop())
-  );
-
-  if (!teamKey) return null;
-  const row = dvpMap[teamKey];
-  if (!row) return null;
-
-  const rankKey = `OPP_${statCol}_RANK`;
-  return row[rankKey] ? parseInt(row[rankKey]) : null;
-}
-
-// ── PLAYER ANALYSIS ───────────────────────────────────────────────────────────
 function analyzePlayer(games, line, stat) {
   const gameList = Object.values(games);
   const avgMins = calcAvg(gameList, 'mins', 10);
@@ -235,8 +131,6 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(200, {'Content-Type': 'application/json'});
   try {
     if (Object.keys(playerMap).length === 0) await loadPlayerMap();
-    await loadInjuries();
-    await loadDVP();
 
     const today = new Date();
     const todayStr = today.toISOString().split('T')[0];
@@ -279,8 +173,6 @@ const server = http.createServer(async (req, res) => {
             if (seen.has(key)) continue;
             seen.add(key);
 
-            if (isInjured(playerName)) continue;
-
             const sharpLine = getSharpPrice(eventProps.bookmakers, playerName, market.key);
             if (!sharpLine) continue;
             if (sharpLine.price > -150) continue;
@@ -299,10 +191,6 @@ const server = http.createServer(async (req, res) => {
             const analysis = analyzePlayer(playerData.body, line, stat);
             if (analysis.skip || !analysis.confirmed) continue;
 
-            // get DVP rank for the defending team
-            // player's team is either home or away — opponent is the other
-            const dvpRank = getDVPRank(homeTeam, market.key) || getDVPRank(awayTeam, market.key);
-
             confirmedPlays.push({
               player: playerName,
               game: `${awayTeam} @ ${homeTeam}`,
@@ -317,8 +205,7 @@ const server = http.createServer(async (req, res) => {
               L5: analysis.L5,
               L10: analysis.L10,
               L20: analysis.L20,
-              stdDev: analysis.stdDev,
-              dvpRank: dvpRank || null
+              stdDev: analysis.stdDev
             });
           }
         }
@@ -336,6 +223,4 @@ const server = http.createServer(async (req, res) => {
 server.listen(process.env.PORT || 3000, () => {
   console.log('Server running');
   loadPlayerMap();
-  loadInjuries();
-  loadDVP();
 });
