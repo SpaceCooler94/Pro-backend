@@ -114,8 +114,8 @@ function analyzePlayer(games, line, stat) {
   };
 }
 
-// ── SHARP PRICE — ANY EXCHANGE AT -150 OR BETTER ──────────────────────────────
-const SHARP_BOOKS = ['novig', 'pinnacle', 'prophetx', 'betopenly'];
+// ── SHARP BOOKS — ALL US EXCHANGES ────────────────────────────────────────────
+const SHARP_BOOKS = ['novig', 'pinnacle', 'prophetx', 'betopenly', 'sporttrade'];
 
 function getSharpPrice(bookmakers, playerName, marketKey) {
   let bestSharp = null;
@@ -128,7 +128,6 @@ function getSharpPrice(bookmakers, playerName, marketKey) {
         if (outcome.name === 'Over' &&
             outcome.description &&
             outcome.description.toLowerCase() === playerName.toLowerCase()) {
-          // keep the sharpest (most negative) price across all sharp books
           if (!bestSharp || outcome.price < bestSharp.price) {
             bestSharp = { book: book.key, price: outcome.price, point: outcome.point };
           }
@@ -189,7 +188,7 @@ async function runAnalysis() {
     const awayTeam = event.away_team;
 
     const eventProps = await fetchURL(
-      `https://api.the-odds-api.com/v4/sports/basketball_nba/events/${event.id}/odds?apiKey=${ODDS_API_KEY}&regions=us,us_ex&markets=${MARKETS.join(',')}&oddsFormat=american&bookmakers=fanduel,draftkings,novig,pinnacle,prophetx,betopenly`
+      `https://api.the-odds-api.com/v4/sports/basketball_nba/events/${event.id}/odds?apiKey=${ODDS_API_KEY}&regions=us,us_ex&markets=${MARKETS.join(',')}&oddsFormat=american&bookmakers=fanduel,draftkings,novig,pinnacle,prophetx,betopenly,sporttrade`
     );
 
     if (!eventProps.bookmakers) continue;
@@ -230,7 +229,6 @@ async function runAnalysis() {
           const analysis = analyzePlayer(playerData.body, line, stat);
           if (analysis.skip || !analysis.confirmed) continue;
 
-          // tanking team flag
           const playerTeam = Object.values(playerData.body)[0]?.team;
           const isTankingPlayer = playerTeam && [...TANKING_TEAMS].some(t =>
             t.toLowerCase().includes(playerTeam.toLowerCase()) ||
