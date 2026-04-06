@@ -9,6 +9,10 @@ let cachedResult = null;
 let cacheTime = 0;
 const CACHE_TTL = 30 * 60 * 1000;
 
+// ── PLAYER GAME LOG CACHE ─────────────────────────────────────────────────────
+const playerLogCache = {};
+const PLAYER_LOG_TTL = 6 * 60 * 60 * 1000; // 6 hours — stats don't change mid-day
+
 // ── TANKING TEAMS ─────────────────────────────────────────────────────────────
 const TANKING_TEAMS = new Set([
   'Toronto Raptors',
@@ -54,6 +58,24 @@ function fetchURL(url) {
       });
     }).on('error', reject);
   });
+}
+
+// ── CACHED PLAYER GAME LOG FETCH ──────────────────────────────────────────────
+async function getPlayerGameLog(playerID) {
+  const now = Date.now();
+  const cached = playerLogCache[playerID];
+  if (cached && (now - cached.time) < PLAYER_LOG_TTL) {
+    return cached.data;
+  }
+  const playerData = await fetchTank01('getNBAGamesForPlayer', {
+    playerID,
+    numberOfGames: '20',
+    season: '2025'
+  });
+  if (playerData.body) {
+    playerLogCache[playerID] = { data: playerData, time: now };
+  }
+  return playerData;
 }
 
 function calcStdDev(games, stat, count) {
@@ -119,7 +141,6 @@ const SHARP_BOOKS = ['novig', 'pinnacle', 'prophetx', 'betopenly', 'sporttrade']
 
 function getSharpPrice(bookmakers, playerName, marketKey) {
   let bestSharp = null;
-
   for (const book of bookmakers) {
     if (!SHARP_BOOKS.includes(book.key)) continue;
     for (const market of book.markets) {
@@ -148,14 +169,19 @@ const STAT_MAP = {
 const MARKETS = Object.keys(STAT_MAP);
 
 let playerMap = {};
+let playerMapTime = 0;
+const PLAYER_MAP_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
 async function loadPlayerMap() {
+  const now = Date.now();
+  if (Object.keys(playerMap).length > 0 && (now - playerMapTime) < PLAYER_MAP_TTL) return;
   try {
     const data = await fetchTank01('getNBAPlayerList', {});
     if (data.body && Array.isArray(data.body)) {
       for (const player of data.body) {
         playerMap[player.longName.toLowerCase().trim()] = player.playerID;
       }
+      playerMapTime = now;
       console.log(`Loaded ${Object.keys(playerMap).length} players`);
     }
   } catch(e) {
@@ -168,7 +194,7 @@ function findPlayerID(playerName) {
 }
 
 async function runAnalysis() {
-  if (Object.keys(playerMap).length === 0) await loadPlayerMap();
+  await loadPlayerMap();
 
   const today = new Date();
   const todayStr = today.toISOString().split('T')[0];
@@ -218,12 +244,8 @@ async function runAnalysis() {
           const playerID = findPlayerID(playerName);
           if (!playerID) continue;
 
-          const playerData = await fetchTank01('getNBAGamesForPlayer', {
-            playerID,
-            numberOfGames: '20',
-            season: '2025'
-          });
-
+          // use cached game log — no repeat Tank01 calls
+          const playerData = await getPlayerGameLog(playerID);
           if (!playerData.body) continue;
 
           const analysis = analyzePlayer(playerData.body, line, stat);
