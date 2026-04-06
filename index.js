@@ -7,7 +7,20 @@ const ODDS_API_KEY = process.env.ODDS_API_KEY;
 // ── CACHE ─────────────────────────────────────────────────────────────────────
 let cachedResult = null;
 let cacheTime = 0;
-const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+const CACHE_TTL = 30 * 60 * 1000;
+
+// ── TANKING TEAMS ─────────────────────────────────────────────────────────────
+// Teams with nothing to play for — minutes managed, unpredictable roles
+const TANKING_TEAMS = new Set([
+  'Toronto Raptors',
+  'Washington Wizards',
+  'Charlotte Hornets',
+  'Utah Jazz',
+  'Portland Trail Blazers',
+  'San Antonio Spurs',
+  'Detroit Pistons',
+  'New Orleans Pelicans',
+]);
 
 function fetchTank01(endpoint, params) {
   return new Promise((resolve, reject) => {
@@ -60,6 +73,13 @@ function calcAvg(games, stat, count) {
   return parseFloat((total / recent.length).toFixed(2));
 }
 
+function calcHitRate(games, stat, line, count) {
+  const recent = games.slice(0, count);
+  if (recent.length === 0) return null;
+  const hits = recent.filter(g => parseFloat(g[stat] || 0) > line).length;
+  return parseFloat((hits / recent.length).toFixed(2));
+}
+
 function analyzePlayer(games, line, stat) {
   const gameList = Object.values(games);
   const avgMins = calcAvg(gameList, 'mins', 10);
@@ -72,16 +92,29 @@ function analyzePlayer(games, line, stat) {
   const L10 = calcAvg(gameList, stat, 10);
   const L20 = calcAvg(gameList, stat, 20);
 
+  // tightened variance filter — skip if std dev > 60% of line
   const stdDev = calcStdDev(gameList, stat, 10);
-  if (stdDev !== null && stdDev > line * 0.8) {
+  if (stdDev !== null && stdDev > line * 0.6) {
     return { skip: true, reason: 'high variance' };
+  }
+
+  // hit rate filter — require 60%+ hit rate over L10
+  const hitRate10 = calcHitRate(gameList, stat, line, 10);
+  if (hitRate10 !== null && hitRate10 < 0.6) {
+    return { skip: true, reason: 'low hit rate' };
+  }
+
+  // hit rate filter — require 60%+ hit rate over L5
+  const hitRate5 = calcHitRate(gameList, stat, line, 5);
+  if (hitRate5 !== null && hitRate5 < 0.6) {
+    return { skip: true, reason: 'low L5 hit rate' };
   }
 
   const confirmed = L5 > line && L10 > line;
 
   return {
     skip: false, avgMins, avgFGA, L5, L10, L20,
-    stdDev, line, stat, confirmed
+    stdDev, hitRate5, hitRate10, line, stat, confirmed
   };
 }
 
@@ -194,6 +227,13 @@ async function runAnalysis() {
           const analysis = analyzePlayer(playerData.body, line, stat);
           if (analysis.skip || !analysis.confirmed) continue;
 
+          // tanking team filter — skip players on teams with nothing to play for
+          const playerTeam = Object.values(playerData.body)[0]?.team;
+          const isTankingPlayer = playerTeam && [...TANKING_TEAMS].some(t =>
+            t.toLowerCase().includes(playerTeam.toLowerCase()) ||
+            playerTeam.toLowerCase().includes(playerTeam.toLowerCase())
+          );
+
           confirmedPlays.push({
             player: playerName,
             game: `${awayTeam} @ ${homeTeam}`,
@@ -208,7 +248,10 @@ async function runAnalysis() {
             L5: analysis.L5,
             L10: analysis.L10,
             L20: analysis.L20,
-            stdDev: analysis.stdDev
+            stdDev: analysis.stdDev,
+            hitRate5: Math.round(analysis.hitRate5 * 100),
+            hitRate10: Math.round(analysis.hitRate10 * 100),
+            tankingTeam: isTankingPlayer || false
           });
         }
       }
@@ -216,7 +259,11 @@ async function runAnalysis() {
   }
 
   confirmedPlays.sort((a, b) => a.sharpPrice - b.sharpPrice);
-  return { confirmedPlays, total: confirmedPlays.length, cachedAt: new Date().toISOString() };
+  return {
+    confirmedPlays,
+    total: confirmedPlays.length,
+    cachedAt: new Date().toISOString()
+  };
 }
 
 const server = http.createServer(async (req, res) => {
