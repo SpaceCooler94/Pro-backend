@@ -10,7 +10,6 @@ let cacheTime = 0;
 const CACHE_TTL = 30 * 60 * 1000;
 
 // ── TANKING TEAMS ─────────────────────────────────────────────────────────────
-// Teams with nothing to play for — minutes managed, unpredictable roles
 const TANKING_TEAMS = new Set([
   'Toronto Raptors',
   'Washington Wizards',
@@ -92,22 +91,19 @@ function analyzePlayer(games, line, stat) {
   const L10 = calcAvg(gameList, stat, 10);
   const L20 = calcAvg(gameList, stat, 20);
 
-  // tightened variance filter — skip if std dev > 60% of line
   const stdDev = calcStdDev(gameList, stat, 10);
   if (stdDev !== null && stdDev > line * 0.6) {
     return { skip: true, reason: 'high variance' };
   }
 
-  // hit rate filter — require 60%+ hit rate over L10
   const hitRate10 = calcHitRate(gameList, stat, line, 10);
   if (hitRate10 !== null && hitRate10 < 0.6) {
-    return { skip: true, reason: 'low hit rate' };
+    return { skip: true, reason: 'low hit rate L10' };
   }
 
-  // hit rate filter — require 60%+ hit rate over L5
   const hitRate5 = calcHitRate(gameList, stat, line, 5);
   if (hitRate5 !== null && hitRate5 < 0.6) {
-    return { skip: true, reason: 'low L5 hit rate' };
+    return { skip: true, reason: 'low hit rate L5' };
   }
 
   const confirmed = L5 > line && L10 > line;
@@ -118,22 +114,29 @@ function analyzePlayer(games, line, stat) {
   };
 }
 
+// ── SHARP PRICE — ANY EXCHANGE AT -150 OR BETTER ──────────────────────────────
+const SHARP_BOOKS = ['novig', 'pinnacle', 'prophetx', 'betopenly'];
+
 function getSharpPrice(bookmakers, playerName, marketKey) {
-  const sharpBooks = ['novig', 'pinnacle'];
+  let bestSharp = null;
+
   for (const book of bookmakers) {
-    if (!sharpBooks.includes(book.key)) continue;
+    if (!SHARP_BOOKS.includes(book.key)) continue;
     for (const market of book.markets) {
       if (market.key !== marketKey) continue;
       for (const outcome of market.outcomes) {
         if (outcome.name === 'Over' &&
             outcome.description &&
             outcome.description.toLowerCase() === playerName.toLowerCase()) {
-          return { book: book.key, price: outcome.price, point: outcome.point };
+          // keep the sharpest (most negative) price across all sharp books
+          if (!bestSharp || outcome.price < bestSharp.price) {
+            bestSharp = { book: book.key, price: outcome.price, point: outcome.point };
+          }
         }
       }
     }
   }
-  return null;
+  return bestSharp;
 }
 
 const STAT_MAP = {
@@ -186,7 +189,7 @@ async function runAnalysis() {
     const awayTeam = event.away_team;
 
     const eventProps = await fetchURL(
-      `https://api.the-odds-api.com/v4/sports/basketball_nba/events/${event.id}/odds?apiKey=${ODDS_API_KEY}&regions=us,us_ex&markets=${MARKETS.join(',')}&oddsFormat=american&bookmakers=fanduel,draftkings,novig,pinnacle`
+      `https://api.the-odds-api.com/v4/sports/basketball_nba/events/${event.id}/odds?apiKey=${ODDS_API_KEY}&regions=us,us_ex&markets=${MARKETS.join(',')}&oddsFormat=american&bookmakers=fanduel,draftkings,novig,pinnacle,prophetx,betopenly`
     );
 
     if (!eventProps.bookmakers) continue;
@@ -227,11 +230,11 @@ async function runAnalysis() {
           const analysis = analyzePlayer(playerData.body, line, stat);
           if (analysis.skip || !analysis.confirmed) continue;
 
-          // tanking team filter — skip players on teams with nothing to play for
+          // tanking team flag
           const playerTeam = Object.values(playerData.body)[0]?.team;
           const isTankingPlayer = playerTeam && [...TANKING_TEAMS].some(t =>
             t.toLowerCase().includes(playerTeam.toLowerCase()) ||
-            playerTeam.toLowerCase().includes(playerTeam.toLowerCase())
+            playerTeam.toLowerCase().includes(t.toLowerCase())
           );
 
           confirmedPlays.push({
