@@ -167,6 +167,9 @@ def _signal(season_avg, l10_avg, line, market_key, vol_3pa):
 # ── FLASK APP ────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
+# Build player ID map at import time so gunicorn workers load it on startup
+_build_id_map()
+
 @app.route("/health")
 def health():
     """Quick ping to confirm server is running."""
