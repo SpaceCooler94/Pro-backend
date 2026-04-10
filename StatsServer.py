@@ -303,13 +303,16 @@ def stats():
         return jsonify({"error": "nba_api not installed on server"}), 503
 
     pid = _find_id(player_name)
+    print(f"[STATS] {player_name} -> pid={pid}", flush=True)
     if pid is None:
-        return jsonify({"found": False, "player": player_name}), 200
+        return jsonify({"found": False, "player": player_name, "reason": "id_not_found"}), 200
 
     _fetch_log(pid)
     rows = _logs.get(pid)
     if not rows:
-        return jsonify({"found": False, "player": player_name}), 200
+        reason = "fetch_failed" if pid in _failed else "no_games"
+        print(f"[STATS] {player_name} pid={pid} rows=None reason={reason}", flush=True)
+        return jsonify({"found": False, "player": player_name, "reason": reason}), 200
 
     l10 = rows[:10]
     l5  = rows[:5]
@@ -426,6 +429,47 @@ def gamelog():
         })
 
     return jsonify({"found": True, "player": player_name, "games": clean})
+
+@app.route("/debug")
+def debug():
+    """
+    GET /debug?player=Dyson+Daniels
+    Shows what the server finds for a player name — ID, log status, sample games.
+    Use this to diagnose "Stats unavailable" issues.
+    """
+    player_name = request.args.get("player", "").strip()
+    if not player_name:
+        return jsonify({"error": "provide player name"}), 400
+
+    n = _norm(player_name)
+    pid = _find_id(player_name)
+
+    # Find similar names in map (for debugging mismatches)
+    parts = n.split()
+    last = parts[-1] if parts else ""
+    similar = [k for k in _id_map if last in k][:10]
+
+    result = {
+        "input":        player_name,
+        "normalized":   n,
+        "pid":          pid,
+        "id_map_size":  len(_id_map),
+        "similar_keys": similar,
+        "log_loaded":   pid in _logs if pid else False,
+        "fetch_failed": pid in _failed if pid else False,
+        "game_count":   len(_logs.get(pid, [])) if pid else 0,
+    }
+
+    if pid and pid in _logs:
+        sample = _logs[pid][:3]
+        result["sample_games"] = [
+            {k: v for k, v in g.items()
+             if k in ("GAME_DATE","MATCHUP","PTS","REB","AST","FG3M","FGA","MIN")}
+            for g in sample
+        ]
+
+    return jsonify(result)
+
 
 @app.route("/pace")
 def pace():
