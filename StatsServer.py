@@ -1,333 +1,255 @@
 """
 StatsServer.py
 --------------
-Lightweight local stats API for Scriptable iOS.
-Wraps nba_api so Scriptable doesn't have to hit stats.nba.com directly.
+NBA stats API for Scriptable iOS prop hunter.
+Uses ESPN's public CDN API — free, no key, no cloud IP blocking.
 
-Usage:
-    pip install nba_api flask
-    python StatsServer.py
-
-Then in Scriptable, fetch:
-    http://<YOUR-MAC-LOCAL-IP>:5001/stats?player=Jalen+Johnson&market=player_threes&line=1.5
-    http://<YOUR-MAC-LOCAL-IP>:5001/gamelog?player=Jalen+Johnson
-
-Find your local IP: System Settings > Wi-Fi > Details > IP Address
-Your Mac and iPhone must be on the same Wi-Fi network.
+All endpoints:
+  /health   — server status
+  /stats    — player L5/L10/Szn averages, hit rates, signal
+  /gamelog  — raw recent game log
+  /debug    — diagnose player lookup issues
+  /pace     — team pace data (coming soon)
+  /bets     — bet tracker web app
 """
 
-import json
-import os
-import re
+import json, os, re, time
+import requests
 from flask import Flask, jsonify, request
 
-try:
-    from nba_api.stats.static import players as _nba_players
-    from nba_api.stats.endpoints import playergamelog as _gamelog
-    NBA_API_OK = True
+app = Flask(__name__)
 
-    # ── BYPASS stats.nba.com DATACENTER BLOCKING ─────────────────────────────
-    # stats.nba.com blocks requests from cloud server IPs (Render, AWS, etc.)
-    # returning HTML error pages instead of JSON. Override the default headers
-    # globally so every nba_api request looks like it comes from a real browser.
-    try:
-        from nba_api.library.http import NBAStatsHTTP
-        NBAStatsHTTP.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                "Version/17.0 Mobile/15E148 Safari/604.1"
-            ),
-            "Referer":         "https://www.nba.com/",
-            "Origin":          "https://www.nba.com",
-            "Accept":          "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "x-nba-stats-origin": "stats",
-            "x-nba-stats-token":  "true",
-            "Connection":      "keep-alive",
-        })
-        print("[OK] nba_api browser headers set — datacenter blocking bypassed", flush=True)
-    except Exception as _he:
-        print(f"[WARN] Could not set nba_api headers: {_he}", flush=True)
-
-except ImportError:
-    NBA_API_OK = False
-    print("[ERROR] nba_api not installed. Run: pip install nba_api flask")
-
-# ── CONFIG ──────────────────────────────────────────────────────────────────
+# ── CONFIG ────────────────────────────────────────────────────────────────────
 NBA_SEASON    = "2025-26"
-THREE_PA_WARN = 5.0   # 3PM unders with 3PA/g >= this get flagged
+ESPN_SEASON   = "2025"          # ESPN uses single year
+THREE_PA_WARN = 5.0
 PORT          = int(os.environ.get("PORT", 5001))
 
-# ── MARKET → GAMELOG COLUMNS ────────────────────────────────────────────────
-MKT_COLS = {
+ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
+ESPN_CORE = "https://sports.core.api.espn.com/v2/sports/basketball/leagues/nba"
+
+ESPN_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+    "Accept":          "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer":         "https://www.espn.com/nba/",
+    "Origin":          "https://www.espn.com",
+}
+
+# ── MARKET → ESPN STAT CATEGORIES ────────────────────────────────────────────
+# ESPN gamelog stats are parallel arrays; these are the abbreviation labels
+MKT_ESPN = {
     "player_points":                  ["PTS"],
     "player_rebounds":                ["REB"],
     "player_assists":                 ["AST"],
-    "player_threes":                  ["FG3M"],
+    "player_threes":                  ["3PM"],
     "player_blocks":                  ["BLK"],
     "player_steals":                  ["STL"],
-    "player_points_rebounds_assists": ["PTS", "REB", "AST"],
-    "player_points_rebounds":         ["PTS", "REB"],
-    "player_points_assists":          ["PTS", "AST"],
-    "player_rebounds_assists":        ["REB", "AST"],
-    # alt markets resolve to same columns
+    "player_points_rebounds_assists": ["PTS","REB","AST"],
+    "player_points_rebounds":         ["PTS","REB"],
+    "player_points_assists":          ["PTS","AST"],
+    "player_rebounds_assists":        ["REB","AST"],
     "player_points_alternate":        ["PTS"],
     "player_rebounds_alternate":      ["REB"],
     "player_assists_alternate":       ["AST"],
-    "player_threes_alternate":        ["FG3M"],
+    "player_threes_alternate":        ["3PM"],
 }
+# Full market name for unknown market fallback
+MKT_COLS = MKT_ESPN
 
-# ── PLAYER CACHE ─────────────────────────────────────────────────────────────
-_id_map   = {}   # norm_name → player_id (int)
-_logs     = {}   # player_id → list[dict] newest-first
-_failed   = set()
+# ── CACHES ────────────────────────────────────────────────────────────────────
+_espn_id_cache  = {}   # norm_name → espn_athlete_id (str) or None
+_espn_log_cache = {}   # espn_athlete_id → list[dict] newest-first
+_espn_failed    = set()
+_pace_cache     = {}
 
+# ── HELPERS ───────────────────────────────────────────────────────────────────
 def _norm(name: str) -> str:
-    """Normalize player name for fuzzy matching."""
     name = name.lower()
     name = re.sub(r"[.'`\-]", " ", name)
     name = re.sub(r"\b(jr|sr|ii|iii|iv)\b", "", name)
     return re.sub(r"\s+", " ", name).strip()
 
-def _build_id_map():
-    if not NBA_API_OK:
-        return
-    # Try static file -- check multiple possible locations
-    possible_paths = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "nba_players.json"),
-        os.path.join(os.getcwd(), "nba_players.json"),
-        "nba_players.json",
-    ]
-    for static_path in possible_paths:
-        if os.path.exists(static_path):
-            try:
-                with open(static_path) as f:
-                    players = json.load(f)
-                for p in players:
-                    _id_map[_norm(p["full_name"])] = p["id"]
-                print(f"[OK] Loaded {len(_id_map)} player IDs from {static_path}", flush=True)
-                return
-            except Exception as e:
-                print(f"[WARN] Could not load {static_path}: {e}", flush=True)
-    print(f"[WARN] nba_players.json not found. Tried: {possible_paths}", flush=True)
-    # Fallback: live nba_api call
-    try:
-        for p in _nba_players.get_players():
-            _id_map[_norm(p["full_name"])] = p["id"]
-        print(f"[OK] Loaded {len(_id_map)} player IDs from nba_api", flush=True)
-    except Exception as e:
-        print(f"[WARN] Could not load player list: {e}", flush=True)
-
-def _find_id(name: str):
-    n = _norm(name)
-    # 1. Exact match
-    if n in _id_map:
-        return _id_map[n]
-
-    # 2. Strict token match — all name parts must appear as whole words in key
-    # Prevents "robinson" matching "robinson-earl" or similar
-    parts = n.split()
-    import re as _re
-    for key, pid in _id_map.items():
-        if all(_re.search(r'\b' + _re.escape(p) + r'\b', key) for p in parts):
-            return pid
-
-    # 3. Suffix-stripped match — handles "Jr.", "Sr.", "III" mismatches
-    stripped = _re.sub(r'\b(jr|sr|ii|iii|iv)\b\.?', '', n).strip()
-    if stripped != n:
-        if stripped in _id_map:
-            return _id_map[stripped]
-        for key, pid in _id_map.items():
-            if all(_re.search(r'\b' + _re.escape(p) + r'\b', key) for p in stripped.split() if p):
-                return pid
-
-    # 4. Live nba_api player search — catches players added mid-season or team changes
-    if NBA_API_OK:
-        try:
-            from nba_api.stats.static import players as _players_mod
-            results = _players_mod.find_players_by_full_name(name)
-            if results:
-                pid = results[0]["id"]
-                # Cache this so subsequent lookups are instant
-                _id_map[n] = pid
-                print(f"[OK] Live lookup found {name} -> {pid}")
-                return pid
-        except Exception as e:
-            print(f"[WARN] Live player lookup failed for {name}: {e}")
-
-    return None
-
-def _fetch_log(pid: int, retries: int = 2):
-    """
-    Fetch and cache game log for player_id. No-op if already cached.
-    Retries on failure since stats.nba.com can transiently block cloud IPs.
-    """
-    if pid in _logs:
-        return  # already cached successfully
-    # Note: we don't skip _failed players here — allow retry on each request
-    # since stats.nba.com blocking is transient. _failed is just for logging.
-    import time
-    for attempt in range(retries):
-        try:
-            if attempt > 0:
-                time.sleep(1.5)  # brief pause before retry
-            gl = _gamelog.PlayerGameLog(
-                player_id=pid,
-                season=NBA_SEASON,
-                season_type_all_star="Regular Season",
-                timeout=25,
-            )
-            df = gl.get_data_frames()[0]
-            if df.empty:
-                _failed.add(pid)
-            else:
-                _logs[pid] = df.to_dict("records")  # newest game first
-                print(f"[OK] Loaded {len(_logs[pid])} games for player_id {pid}", flush=True)
-            return  # success or empty — don't retry
-        except Exception as e:
-            err_str = str(e)
-            print(f"[WARN] Attempt {attempt+1}/{retries} failed for {pid}: {err_str[:80]}", flush=True)
-            if attempt == retries - 1:
-                _failed.add(pid)
-
-# Usage rate cache — separate from game logs since it needs advanced stats endpoint
-_usage_cache = {}  # player_id -> float (usage %) or None
-
-def _get_usage(pid: int):
-    """
-    Fetch season usage rate % for a player.
-    Usage rate = % of team plays used by the player while on the floor.
-    High usage (30%+) = primary option. Low (15%-) = role player.
-    Returns float like 28.4 or None if unavailable.
-    """
-    if pid in _usage_cache:
-        return _usage_cache[pid]
-    if not NBA_API_OK:
-        return None
-    try:
-        from nba_api.stats.endpoints import playerdashboardbygeneralsplits
-        dash = playerdashboardbygeneralsplits.PlayerDashboardByGeneralSplits(
-            player_id=pid,
-            season=NBA_SEASON,
-            season_type_all_star="Regular Season",
-            measure_type_simple="Advanced",
-            timeout=25,
-        )
-        df = dash.get_data_frames()[0]
-        if df.empty or "USG_PCT" not in df.columns:
-            _usage_cache[pid] = None
-            return None
-        usg = round(float(df["USG_PCT"].iloc[0]) * 100, 1)
-        _usage_cache[pid] = usg
-        return usg
-    except Exception as e:
-        print(f"[WARN] Usage rate fetch failed for {pid}: {e}")
-        _usage_cache[pid] = None
-        return None
-
-# Team pace cache — fetched once per session
-_pace_cache = {}  # team_name_norm -> pace float
-
 def _norm_team(name: str) -> str:
     return re.sub(r"\s+", " ", name.lower().strip())
 
-def _load_pace():
-    """Load all team pace data from nba_api advanced team stats."""
-    if _pace_cache:
-        return
-    if not NBA_API_OK:
-        return
-    try:
-        from nba_api.stats.endpoints import leaguedashteamstats
-        ts = leaguedashteamstats.LeagueDashTeamStats(
-            season=NBA_SEASON,
-            season_type_all_star="Regular Season",
-            measure_type_simple="Advanced",
-            timeout=25,
-        )
-        df = ts.get_data_frames()[0]
-        if df.empty:
-            return
-        for _, row in df.iterrows():
-            team_name = str(row.get("TEAM_NAME", "")).lower()
-            pace = row.get("PACE")
-            if team_name and pace is not None:
-                _pace_cache[team_name] = round(float(pace), 1)
-        print(f"[OK] Loaded pace for {len(_pace_cache)} teams")
-    except Exception as e:
-        print(f"[WARN] Pace load failed: {e}")
-
-
-    if not rows:
-        return None
-    vals = [sum(float(r.get(c) or 0) for c in cols) for r in rows]
+def _avg(rows, cols):
+    vals = []
+    for r in rows:
+        try:
+            vals.append(round(sum(float(r.get(c) or 0) for c in cols), 1))
+        except Exception:
+            pass
     return round(sum(vals) / len(vals), 1) if vals else None
 
 def _hit_rate(rows, cols, line):
-    """Returns 'X/N' string showing how often player cleared this line."""
-    if not rows:
-        return None
-    hits = sum(
-        1 for r in rows
-        if sum(float(r.get(c) or 0) for c in cols) > line
-    )
-    return f"{hits}/{len(rows)}"
+    hits = total = 0
+    for r in rows:
+        try:
+            val = sum(float(r.get(c) or 0) for c in cols)
+            total += 1
+            if val >= line: hits += 1
+        except Exception:
+            pass
+    return f"{hits}/{total}" if total > 0 else None
 
 def _signal(season_avg, l10_avg, line, market_key, vol_3pa):
+    if season_avg is None or l10_avg is None or line is None:
+        return "NEUTRAL", None
+    if market_key in ("player_threes", "player_threes_alternate"):
+        if vol_3pa and vol_3pa >= THREE_PA_WARN:
+            return "FADE_UNDER", f"HIGH VOLUME ({vol_3pa} 3PA/g L10) — fade unders"
+    s_gap = season_avg - line
+    l_gap = l10_avg - line
+    if s_gap >= 1.5 and l_gap >= 1.5:   return "HAMMER_OVER",  None
+    if s_gap <= -1.5 and l_gap <= -1.5: return "HAMMER_UNDER", None
+    if s_gap >= 0.5  and l_gap >= 0.5:  return "LEAN_OVER",    None
+    if s_gap <= -0.5 and l_gap <= -0.5: return "LEAN_UNDER",   None
+    return "NEUTRAL", None
+
+# ── ESPN PLAYER SEARCH ────────────────────────────────────────────────────────
+def _find_espn_id(name: str):
+    """Find ESPN athlete ID by name search. Cached per session."""
+    n = _norm(name)
+    if n in _espn_id_cache:
+        return _espn_id_cache[n]
+    try:
+        r = requests.get(
+            f"{ESPN_BASE}/athletes",
+            params={"limit": 15, "search": name},
+            headers=ESPN_HEADERS,
+            timeout=10,
+        )
+        r.raise_for_status()
+        data     = r.json()
+        athletes = data.get("athletes", data.get("items", []))
+
+        if not athletes:
+            print(f"[WARN] ESPN: no results for '{name}'", flush=True)
+            _espn_id_cache[n] = None
+            return None
+
+        # Try exact normalized match first
+        best_id = None
+        for a in athletes:
+            full = _norm(a.get("fullName") or a.get("displayName") or "")
+            if full == n:
+                best_id = str(a.get("id") or a.get("uid","").split(":")[-1])
+                break
+
+        # Fall back to first result
+        if not best_id:
+            a       = athletes[0]
+            best_id = str(a.get("id") or a.get("uid","").split(":")[-1])
+            found   = a.get("fullName") or a.get("displayName")
+            print(f"[INFO] ESPN: '{name}' → '{found}' (id={best_id})", flush=True)
+
+        _espn_id_cache[n] = best_id
+        return best_id
+
+    except Exception as e:
+        print(f"[WARN] ESPN player search failed for '{name}': {e}", flush=True)
+        _espn_id_cache[n] = None
+        return None
+
+# ── ESPN GAME LOG FETCH ───────────────────────────────────────────────────────
+def _fetch_espn_log(espn_id: str):
     """
-    Determines betting signal based on player profile vs line.
-    Returns (signal_str, warn_str).
+    Fetch season game log from ESPN athlete gamelog endpoint.
+    ESPN returns parallel arrays: categories (stat labels) + events (values).
+    We parse into list of dicts keyed by stat abbreviation.
     """
-    if season_avg is None or l10_avg is None:
-        return None, None
+    if espn_id in _espn_log_cache:
+        return
+    try:
+        r = requests.get(
+            f"{ESPN_BASE}/athletes/{espn_id}/gamelog",
+            params={"season": ESPN_SEASON},
+            headers=ESPN_HEADERS,
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
 
-    m    = season_avg - line   # positive = avg is above the line (lean over)
-    m10  = l10_avg    - line
+        # ESPN gamelog format:
+        # categories: [{name, abbreviation}, ...]
+        # events: {event_id: {stats: [v1, v2, ...], eventId, ...}}
+        # seasonTypes: [{categories, events}]  — same structure
+        categories = []
+        events_raw = {}
 
-    # 3PM volume override — if attempting 5+ per game, under is high risk
-    if market_key == "player_threes" and vol_3pa and vol_3pa >= THREE_PA_WARN:
-        return "FADE_UNDER", f"HIGH VOLUME ({vol_3pa} 3PA/g L10) — fade unders"
+        # Try top-level structure first
+        if "categories" in data and "events" in data:
+            categories = data["categories"]
+            events_raw = data["events"]
+        # Else look inside seasonTypes[0] (regular season)
+        elif "seasonTypes" in data:
+            for st in data.get("seasonTypes", []):
+                if st.get("type") in (2, "2", "regular"):
+                    categories = st.get("categories", [])
+                    events_raw = st.get("events", {})
+                    break
+            if not categories and data.get("seasonTypes"):
+                st = data["seasonTypes"][0]
+                categories = st.get("categories", [])
+                events_raw = st.get("events", {})
 
-    if   m >  1.5 and m10 >  1.0: return "HAMMER_OVER",  None
-    elif m >  0.5 and m10 >  0.5: return "LEAN_OVER",    None
-    elif m < -1.5 and m10 < -1.0: return "HAMMER_UNDER", None
-    elif m < -0.5 and m10 < -0.5: return "LEAN_UNDER",   None
-    else:                          return "NEUTRAL",       None
+        if not categories or not events_raw:
+            print(f"[WARN] ESPN: empty gamelog for {espn_id}", flush=True)
+            _espn_failed.add(espn_id)
+            return
 
-# ── FLASK APP ────────────────────────────────────────────────────────────────
-app = Flask(__name__)
+        # Build abbreviation list from categories
+        abbrevs = [c.get("abbreviation", c.get("name","")).upper() for c in categories]
 
-# Build player ID map at import time so gunicorn workers load it on startup
-_build_id_map()
+        # Parse each event into a flat dict
+        games = []
+        for event_id, ev in events_raw.items():
+            stats_vals = ev.get("stats", [])
+            if not stats_vals:
+                continue
+            row = {"event_id": event_id}
+            # Match values to abbreviations
+            for i, val in enumerate(stats_vals):
+                if i < len(abbrevs):
+                    row[abbrevs[i]] = val
+            # Also store date if available
+            row["date"] = ev.get("eventDate", ev.get("date", ""))
+            games.append(row)
 
+        if not games:
+            _espn_failed.add(espn_id)
+            print(f"[WARN] ESPN: parsed 0 games for {espn_id}", flush=True)
+            return
+
+        # Sort newest first by date
+        games.sort(key=lambda g: g.get("date", ""), reverse=True)
+        _espn_log_cache[espn_id] = games
+        print(f"[OK] ESPN: loaded {len(games)} games for athlete {espn_id}", flush=True)
+
+    except Exception as e:
+        print(f"[WARN] ESPN game log failed for {espn_id}: {e}", flush=True)
+        _espn_failed.add(espn_id)
+
+# ── ROUTES ────────────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
-    """Quick ping to confirm server is running."""
     return jsonify({
-        "status":    "ok",
-        "nba_api":   NBA_API_OK,
-        "players":   len(_id_map),
-        "cached":    len(_logs),
-        "season":    NBA_SEASON,
+        "status":         "ok",
+        "season":         NBA_SEASON,
+        "players_cached": len(_espn_id_cache),
+        "logs_cached":    len(_espn_log_cache),
+        "source":         "espn",
     })
 
 @app.route("/stats")
 def stats():
-    """
-    GET /stats?player=Jalen+Johnson&market=player_threes&line=1.5
-
-    Returns season avg, L10, L5, hit rates, 3PA/g, signal, and warn.
-    Scriptable uses this to show the stat line under each edge.
-    """
     player_name = request.args.get("player", "").strip()
     market_key  = request.args.get("market", "").strip()
     line_str    = request.args.get("line",   "0").strip()
 
     if not player_name or not market_key:
         return jsonify({"error": "player and market are required"}), 400
-
     try:
         line = float(line_str)
     except ValueError:
@@ -337,19 +259,14 @@ def stats():
     if not cols:
         return jsonify({"error": f"unknown market: {market_key}"}), 400
 
-    if not NBA_API_OK:
-        return jsonify({"error": "nba_api not installed on server"}), 503
-
-    pid = _find_id(player_name)
-    print(f"[STATS] {player_name} -> pid={pid}", flush=True)
-    if pid is None:
+    espn_id = _find_espn_id(player_name)
+    if espn_id is None:
         return jsonify({"found": False, "player": player_name, "reason": "id_not_found"}), 200
 
-    _fetch_log(pid)
-    rows = _logs.get(pid)
+    _fetch_espn_log(espn_id)
+    rows = _espn_log_cache.get(espn_id)
     if not rows:
-        reason = "fetch_failed" if pid in _failed else "no_games"
-        print(f"[STATS] {player_name} pid={pid} rows=None reason={reason}", flush=True)
+        reason = "fetch_failed" if espn_id in _espn_failed else "no_games"
         return jsonify({"found": False, "player": player_name, "reason": reason}), 200
 
     l10 = rows[:10]
@@ -364,45 +281,36 @@ def stats():
     # 3PA volume for 3PM props
     vol_3pa = None
     if market_key in ("player_threes", "player_threes_alternate"):
-        atts = [float(r.get("FG3A") or 0) for r in l10]
+        atts = [float(r.get("3PA") or 0) for r in l10 if r.get("3PA") is not None]
         vol_3pa = round(sum(atts) / len(atts), 1) if atts else None
 
-    # FGA per game (L10) — shot volume context for scoring props
-    fga_l10 = None
-    if l10:
-        fga_vals = [float(r.get("FGA") or 0) for r in l10]
-        fga_l10 = round(sum(fga_vals) / len(fga_vals), 1) if fga_vals else None
+    # FGA per game L10
+    fga_vals = [float(r.get("FGA") or 0) for r in l10 if r.get("FGA") is not None]
+    fga_l10  = round(sum(fga_vals) / len(fga_vals), 1) if fga_vals else None
 
-    # Minutes per game (L10) — usage context
-    min_l10 = None
-    if l10:
-        min_vals = []
-        for r in l10:
-            try:
-                m = r.get("MIN") or "0"
-                # MIN can be "32:14" or "32.5" — handle both
-                if isinstance(m, str) and ":" in m:
-                    parts = m.split(":")
-                    min_vals.append(float(parts[0]) + float(parts[1]) / 60)
-                else:
-                    min_vals.append(float(m))
-            except Exception:
-                pass
-        min_l10 = round(sum(min_vals) / len(min_vals), 1) if min_vals else None
+    # Minutes per game L10
+    min_vals = []
+    for r in l10:
+        m = r.get("MIN") or r.get("MINS") or ""
+        try:
+            if isinstance(m, str) and ":" in m:
+                p = m.split(":")
+                min_vals.append(float(p[0]) + float(p[1]) / 60)
+            elif m:
+                min_vals.append(float(m))
+        except Exception:
+            pass
+    min_l10 = round(sum(min_vals) / len(min_vals), 1) if min_vals else None
 
-    # Usage rate — fetch from advanced stats endpoint
-    # Cached separately per player since it requires an extra API call
-    usg_pct = _get_usage(pid)
-
-    signal, warn = _signal(season_avg, l10_avg, line, market_key, vol_3pa)
-
-    # Last 5 raw values for sparkline display in Scriptable
+    # Sparkline
     last5_raw = []
     for r in l5:
         try:
             last5_raw.append(round(sum(float(r.get(c) or 0) for c in cols), 1))
         except Exception:
             pass
+
+    signal, warn = _signal(season_avg, l10_avg, line, market_key, vol_3pa)
 
     return jsonify({
         "found":      True,
@@ -415,159 +323,86 @@ def stats():
         "hr_season":  hr_season,
         "hr_l10":     hr_l10,
         "vol_3pa":    vol_3pa,
-        "fga_l10":    fga_l10,    # avg shot attempts L10 — context for PTS props
-        "min_l10":    min_l10,    # avg minutes L10 — usage context
-        "usg_pct":    usg_pct,    # usage rate % — % of team plays used by player
+        "fga_l10":    fga_l10,
+        "min_l10":    min_l10,
+        "usg_pct":    None,
         "signal":     signal,
         "warn":       warn,
         "last5_raw":  last5_raw,
         "games":      len(rows),
+        "source":     "espn",
     })
 
 @app.route("/gamelog")
 def gamelog():
-    """
-    GET /gamelog?player=Jalen+Johnson&n=10
-
-    Returns raw last N game values for all tracked stat categories.
-    Useful for debugging or building custom displays in Scriptable.
-    """
     player_name = request.args.get("player", "").strip()
-    n           = int(request.args.get("n", 10))
-
+    n_str       = request.args.get("n", "10")
     if not player_name:
         return jsonify({"error": "player is required"}), 400
+    try:
+        n = int(n_str)
+    except ValueError:
+        n = 10
 
-    if not NBA_API_OK:
-        return jsonify({"error": "nba_api not installed"}), 503
-
-    pid = _find_id(player_name)
-    if pid is None:
+    espn_id = _find_espn_id(player_name)
+    if espn_id is None:
         return jsonify({"found": False, "player": player_name}), 200
 
-    _fetch_log(pid)
-    rows = _logs.get(pid, [])[:n]
+    _fetch_espn_log(espn_id)
+    rows = _espn_log_cache.get(espn_id)
     if not rows:
         return jsonify({"found": False, "player": player_name}), 200
 
-    # Return a clean subset of columns rather than the full raw row
-    clean = []
-    for r in rows:
-        clean.append({
-            "date":  r.get("GAME_DATE"),
-            "matchup": r.get("MATCHUP"),
-            "pts":   r.get("PTS"),
-            "reb":   r.get("REB"),
-            "ast":   r.get("AST"),
-            "fg3m":  r.get("FG3M"),
-            "fg3a":  r.get("FG3A"),
-            "blk":   r.get("BLK"),
-            "stl":   r.get("STL"),
-            "min":   r.get("MIN"),
-        })
-
-    return jsonify({"found": True, "player": player_name, "games": clean})
+    return jsonify({"found": True, "player": player_name, "games": rows[:n]})
 
 @app.route("/debug")
 def debug():
-    """
-    GET /debug?player=Dyson+Daniels
-    Shows what the server finds for a player name — ID, log status, sample games.
-    Use this to diagnose "Stats unavailable" issues.
-    """
     player_name = request.args.get("player", "").strip()
     if not player_name:
         return jsonify({"error": "provide player name"}), 400
 
-    n = _norm(player_name)
-    pid = _find_id(player_name)
-
-    # Find similar names in map (for debugging mismatches)
-    parts = n.split()
-    last = parts[-1] if parts else ""
-    similar = [k for k in _id_map if last in k][:10]
+    n       = _norm(player_name)
+    espn_id = _find_espn_id(player_name)
 
     result = {
         "input":        player_name,
         "normalized":   n,
-        "pid":          pid,
-        "id_map_size":  len(_id_map),
-        "similar_keys": similar,
-        "log_loaded":   pid in _logs if pid else False,
-        "fetch_failed": pid in _failed if pid else False,
-        "game_count":   len(_logs.get(pid, [])) if pid else 0,
+        "espn_id":      espn_id,
+        "log_cached":   espn_id in _espn_log_cache if espn_id else False,
+        "fetch_failed": espn_id in _espn_failed    if espn_id else False,
+        "game_count":   len(_espn_log_cache.get(espn_id, [])) if espn_id else 0,
+        "source":       "espn",
     }
 
-    if pid and pid in _logs:
-        sample = _logs[pid][:3]
-        result["sample_games"] = [
-            {k: v for k, v in g.items()
-             if k in ("GAME_DATE","MATCHUP","PTS","REB","AST","FG3M","FGA","MIN")}
-            for g in sample
-        ]
-
+    if espn_id and espn_id in _espn_log_cache:
+        sample = _espn_log_cache[espn_id][:2]
+        result["sample_game_keys"] = list(sample[0].keys()) if sample else []
+        result["sample_games"]     = sample
     return jsonify(result)
-
 
 @app.route("/pace")
 def pace():
-    """
-    GET /pace?home=Atlanta Hawks&away=Cleveland Cavaliers
-
-    Returns pace for both teams + avg game pace.
-    High pace = more possessions = more stat opportunities = favor overs.
-    Low pace = fewer possessions = fewer opportunities = favor unders.
-    NBA avg pace is ~100 possessions per 48 min. Top teams 103+, slow teams 96-.
-    """
     home = request.args.get("home", "").strip()
     away = request.args.get("away", "").strip()
-
     if not home and not away:
         return jsonify({"error": "provide home and/or away team name"}), 400
-
-    _load_pace()
-
-    def find_pace(team_name):
-        n = _norm_team(team_name)
-        # Try exact match first
-        if n in _pace_cache:
-            return _pace_cache[n]
-        # Partial match — last word of team name (e.g. "hawks")
-        last = n.split()[-1] if n else ""
-        for key, pace in _pace_cache.items():
-            if last and last in key:
-                return pace
+    def find_pace(t):
+        nk = _norm_team(t)
+        if nk in _pace_cache: return _pace_cache[nk]
+        last = nk.split()[-1] if nk else ""
+        for key, p in _pace_cache.items():
+            if last and last in key: return p
         return None
-
     home_pace = find_pace(home) if home else None
     away_pace = find_pace(away) if away else None
+    avg_pace  = round((home_pace + away_pace) / 2, 1) if home_pace and away_pace else (home_pace or away_pace)
+    signal    = ("FAST" if avg_pace and avg_pace >= 103
+                 else "SLOW" if avg_pace and avg_pace < 100
+                 else "AVERAGE") if avg_pace else None
+    return jsonify({"home": home, "away": away,
+                    "home_pace": home_pace, "away_pace": away_pace,
+                    "avg_pace": avg_pace, "pace_signal": signal})
 
-    avg_pace = None
-    if home_pace and away_pace:
-        avg_pace = round((home_pace + away_pace) / 2, 1)
-    elif home_pace:
-        avg_pace = home_pace
-    elif away_pace:
-        avg_pace = away_pace
-
-    # Pace signal — NBA average is ~100
-    pace_signal = None
-    if avg_pace:
-        if avg_pace >= 103:
-            pace_signal = "FAST"     # favor overs
-        elif avg_pace >= 100:
-            pace_signal = "AVERAGE"
-        else:
-            pace_signal = "SLOW"     # favor unders
-
-    return jsonify({
-        "home":        home,
-        "away":        away,
-        "home_pace":   home_pace,
-        "away_pace":   away_pace,
-        "avg_pace":    avg_pace,
-        "pace_signal": pace_signal,
-    })
 
 
 @app.route("/bets")
