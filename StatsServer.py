@@ -25,6 +25,32 @@ try:
     from nba_api.stats.static import players as _nba_players
     from nba_api.stats.endpoints import playergamelog as _gamelog
     NBA_API_OK = True
+
+    # ── BYPASS stats.nba.com DATACENTER BLOCKING ─────────────────────────────
+    # stats.nba.com blocks requests from cloud server IPs (Render, AWS, etc.)
+    # returning HTML error pages instead of JSON. Override the default headers
+    # globally so every nba_api request looks like it comes from a real browser.
+    try:
+        from nba_api.library.http import NBAStatsHTTP
+        NBAStatsHTTP.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                "Version/17.0 Mobile/15E148 Safari/604.1"
+            ),
+            "Referer":         "https://www.nba.com/",
+            "Origin":          "https://www.nba.com",
+            "Accept":          "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "x-nba-stats-origin": "stats",
+            "x-nba-stats-token":  "true",
+            "Connection":      "keep-alive",
+        })
+        print("[OK] nba_api browser headers set — datacenter blocking bypassed", flush=True)
+    except Exception as _he:
+        print(f"[WARN] Could not set nba_api headers: {_he}", flush=True)
+
 except ImportError:
     NBA_API_OK = False
     print("[ERROR] nba_api not installed. Run: pip install nba_api flask")
@@ -133,26 +159,38 @@ def _find_id(name: str):
 
     return None
 
-def _fetch_log(pid: int):
-    """Fetch and cache game log for player_id. No-op if already cached."""
-    if pid in _logs or pid in _failed:
-        return
-    try:
-        gl = _gamelog.PlayerGameLog(
-            player_id=pid,
-            season=NBA_SEASON,
-            season_type_all_star="Regular Season",
-            timeout=12,
-        )
-        df = gl.get_data_frames()[0]
-        if df.empty:
-            _failed.add(pid)
-        else:
-            _logs[pid] = df.to_dict("records")  # newest game first
-            print(f"[OK] Loaded {len(_logs[pid])} games for player_id {pid}")
-    except Exception as e:
-        print(f"[WARN] Failed to load game log for {pid}: {e}")
-        _failed.add(pid)
+def _fetch_log(pid: int, retries: int = 2):
+    """
+    Fetch and cache game log for player_id. No-op if already cached.
+    Retries on failure since stats.nba.com can transiently block cloud IPs.
+    """
+    if pid in _logs:
+        return  # already cached successfully
+    # Note: we don't skip _failed players here — allow retry on each request
+    # since stats.nba.com blocking is transient. _failed is just for logging.
+    import time
+    for attempt in range(retries):
+        try:
+            if attempt > 0:
+                time.sleep(1.5)  # brief pause before retry
+            gl = _gamelog.PlayerGameLog(
+                player_id=pid,
+                season=NBA_SEASON,
+                season_type_all_star="Regular Season",
+                timeout=25,
+            )
+            df = gl.get_data_frames()[0]
+            if df.empty:
+                _failed.add(pid)
+            else:
+                _logs[pid] = df.to_dict("records")  # newest game first
+                print(f"[OK] Loaded {len(_logs[pid])} games for player_id {pid}", flush=True)
+            return  # success or empty — don't retry
+        except Exception as e:
+            err_str = str(e)
+            print(f"[WARN] Attempt {attempt+1}/{retries} failed for {pid}: {err_str[:80]}", flush=True)
+            if attempt == retries - 1:
+                _failed.add(pid)
 
 # Usage rate cache — separate from game logs since it needs advanced stats endpoint
 _usage_cache = {}  # player_id -> float (usage %) or None
@@ -175,7 +213,7 @@ def _get_usage(pid: int):
             season=NBA_SEASON,
             season_type_all_star="Regular Season",
             measure_type_simple="Advanced",
-            timeout=12,
+            timeout=25,
         )
         df = dash.get_data_frames()[0]
         if df.empty or "USG_PCT" not in df.columns:
@@ -207,7 +245,7 @@ def _load_pace():
             season=NBA_SEASON,
             season_type_all_star="Regular Season",
             measure_type_simple="Advanced",
-            timeout=12,
+            timeout=25,
         )
         df = ts.get_data_frames()[0]
         if df.empty:
