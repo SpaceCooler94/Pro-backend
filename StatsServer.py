@@ -96,14 +96,41 @@ def _build_id_map():
 
 def _find_id(name: str):
     n = _norm(name)
-    # Exact match
+    # 1. Exact match
     if n in _id_map:
         return _id_map[n]
-    # Partial match — all tokens present in key
+
+    # 2. Strict token match — all name parts must appear as whole words in key
+    # Prevents "robinson" matching "robinson-earl" or similar
     parts = n.split()
+    import re as _re
     for key, pid in _id_map.items():
-        if all(p in key for p in parts):
+        if all(_re.search(r'\b' + _re.escape(p) + r'\b', key) for p in parts):
             return pid
+
+    # 3. Suffix-stripped match — handles "Jr.", "Sr.", "III" mismatches
+    stripped = _re.sub(r'\b(jr|sr|ii|iii|iv)\b\.?', '', n).strip()
+    if stripped != n:
+        if stripped in _id_map:
+            return _id_map[stripped]
+        for key, pid in _id_map.items():
+            if all(_re.search(r'\b' + _re.escape(p) + r'\b', key) for p in stripped.split() if p):
+                return pid
+
+    # 4. Live nba_api player search — catches players added mid-season or team changes
+    if NBA_API_OK:
+        try:
+            from nba_api.stats.static import players as _players_mod
+            results = _players_mod.find_players_by_full_name(name)
+            if results:
+                pid = results[0]["id"]
+                # Cache this so subsequent lookups are instant
+                _id_map[n] = pid
+                print(f"[OK] Live lookup found {name} -> {pid}")
+                return pid
+        except Exception as e:
+            print(f"[WARN] Live player lookup failed for {name}: {e}")
+
     return None
 
 def _fetch_log(pid: int):
@@ -127,7 +154,74 @@ def _fetch_log(pid: int):
         print(f"[WARN] Failed to load game log for {pid}: {e}")
         _failed.add(pid)
 
-def _avg(rows, cols):
+# Usage rate cache — separate from game logs since it needs advanced stats endpoint
+_usage_cache = {}  # player_id -> float (usage %) or None
+
+def _get_usage(pid: int):
+    """
+    Fetch season usage rate % for a player.
+    Usage rate = % of team plays used by the player while on the floor.
+    High usage (30%+) = primary option. Low (15%-) = role player.
+    Returns float like 28.4 or None if unavailable.
+    """
+    if pid in _usage_cache:
+        return _usage_cache[pid]
+    if not NBA_API_OK:
+        return None
+    try:
+        from nba_api.stats.endpoints import playerdashboardbygeneralsplits
+        dash = playerdashboardbygeneralsplits.PlayerDashboardByGeneralSplits(
+            player_id=pid,
+            season=NBA_SEASON,
+            season_type_all_star="Regular Season",
+            measure_type_simple="Advanced",
+            timeout=12,
+        )
+        df = dash.get_data_frames()[0]
+        if df.empty or "USG_PCT" not in df.columns:
+            _usage_cache[pid] = None
+            return None
+        usg = round(float(df["USG_PCT"].iloc[0]) * 100, 1)
+        _usage_cache[pid] = usg
+        return usg
+    except Exception as e:
+        print(f"[WARN] Usage rate fetch failed for {pid}: {e}")
+        _usage_cache[pid] = None
+        return None
+
+# Team pace cache — fetched once per session
+_pace_cache = {}  # team_name_norm -> pace float
+
+def _norm_team(name: str) -> str:
+    return re.sub(r"\s+", " ", name.lower().strip())
+
+def _load_pace():
+    """Load all team pace data from nba_api advanced team stats."""
+    if _pace_cache:
+        return
+    if not NBA_API_OK:
+        return
+    try:
+        from nba_api.stats.endpoints import leaguedashteamstats
+        ts = leaguedashteamstats.LeagueDashTeamStats(
+            season=NBA_SEASON,
+            season_type_all_star="Regular Season",
+            measure_type_simple="Advanced",
+            timeout=12,
+        )
+        df = ts.get_data_frames()[0]
+        if df.empty:
+            return
+        for _, row in df.iterrows():
+            team_name = str(row.get("TEAM_NAME", "")).lower()
+            pace = row.get("PACE")
+            if team_name and pace is not None:
+                _pace_cache[team_name] = round(float(pace), 1)
+        print(f"[OK] Loaded pace for {len(_pace_cache)} teams")
+    except Exception as e:
+        print(f"[WARN] Pace load failed: {e}")
+
+
     if not rows:
         return None
     vals = [sum(float(r.get(c) or 0) for c in cols) for r in rows]
@@ -232,6 +326,33 @@ def stats():
         atts = [float(r.get("FG3A") or 0) for r in l10]
         vol_3pa = round(sum(atts) / len(atts), 1) if atts else None
 
+    # FGA per game (L10) — shot volume context for scoring props
+    fga_l10 = None
+    if l10:
+        fga_vals = [float(r.get("FGA") or 0) for r in l10]
+        fga_l10 = round(sum(fga_vals) / len(fga_vals), 1) if fga_vals else None
+
+    # Minutes per game (L10) — usage context
+    min_l10 = None
+    if l10:
+        min_vals = []
+        for r in l10:
+            try:
+                m = r.get("MIN") or "0"
+                # MIN can be "32:14" or "32.5" — handle both
+                if isinstance(m, str) and ":" in m:
+                    parts = m.split(":")
+                    min_vals.append(float(parts[0]) + float(parts[1]) / 60)
+                else:
+                    min_vals.append(float(m))
+            except Exception:
+                pass
+        min_l10 = round(sum(min_vals) / len(min_vals), 1) if min_vals else None
+
+    # Usage rate — fetch from advanced stats endpoint
+    # Cached separately per player since it requires an extra API call
+    usg_pct = _get_usage(pid)
+
     signal, warn = _signal(season_avg, l10_avg, line, market_key, vol_3pa)
 
     # Last 5 raw values for sparkline display in Scriptable
@@ -253,6 +374,9 @@ def stats():
         "hr_season":  hr_season,
         "hr_l10":     hr_l10,
         "vol_3pa":    vol_3pa,
+        "fga_l10":    fga_l10,    # avg shot attempts L10 — context for PTS props
+        "min_l10":    min_l10,    # avg minutes L10 — usage context
+        "usg_pct":    usg_pct,    # usage rate % — % of team plays used by player
         "signal":     signal,
         "warn":       warn,
         "last5_raw":  last5_raw,
@@ -303,9 +427,66 @@ def gamelog():
 
     return jsonify({"found": True, "player": player_name, "games": clean})
 
-# ── STARTUP ──────────────────────────────────────────────────────────────────
+@app.route("/pace")
+def pace():
+    """
+    GET /pace?home=Atlanta Hawks&away=Cleveland Cavaliers
 
-@app.route("/bets")
+    Returns pace for both teams + avg game pace.
+    High pace = more possessions = more stat opportunities = favor overs.
+    Low pace = fewer possessions = fewer opportunities = favor unders.
+    NBA avg pace is ~100 possessions per 48 min. Top teams 103+, slow teams 96-.
+    """
+    home = request.args.get("home", "").strip()
+    away = request.args.get("away", "").strip()
+
+    if not home and not away:
+        return jsonify({"error": "provide home and/or away team name"}), 400
+
+    _load_pace()
+
+    def find_pace(team_name):
+        n = _norm_team(team_name)
+        # Try exact match first
+        if n in _pace_cache:
+            return _pace_cache[n]
+        # Partial match — last word of team name (e.g. "hawks")
+        last = n.split()[-1] if n else ""
+        for key, pace in _pace_cache.items():
+            if last and last in key:
+                return pace
+        return None
+
+    home_pace = find_pace(home) if home else None
+    away_pace = find_pace(away) if away else None
+
+    avg_pace = None
+    if home_pace and away_pace:
+        avg_pace = round((home_pace + away_pace) / 2, 1)
+    elif home_pace:
+        avg_pace = home_pace
+    elif away_pace:
+        avg_pace = away_pace
+
+    # Pace signal — NBA average is ~100
+    pace_signal = None
+    if avg_pace:
+        if avg_pace >= 103:
+            pace_signal = "FAST"     # favor overs
+        elif avg_pace >= 100:
+            pace_signal = "AVERAGE"
+        else:
+            pace_signal = "SLOW"     # favor unders
+
+    return jsonify({
+        "home":        home,
+        "away":        away,
+        "home_pace":   home_pace,
+        "away_pace":   away_pace,
+        "avg_pace":    avg_pace,
+        "pace_signal": pace_signal,
+    })
+
 
 @app.route("/bets")
 def bets_app():
